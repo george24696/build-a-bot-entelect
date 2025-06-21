@@ -1,6 +1,5 @@
 using BuildABot2025.Enums;
 using BuildABot2025.Models;
-using System;
 using System.Collections.Generic;
 using System.Linq;
 
@@ -9,128 +8,99 @@ namespace BuildABot2025.Services;
 public class BotService
 {
     private Guid _botId;
-
-    // State tracking to prevent loops and unproductive behavior
-    private Cell? _currentTarget;
-    private int _ticksStuckOnTarget = 0;
-    private const int STUCK_THRESHOLD = 5; // After this many ticks without progress, find a new target
-    private readonly HashSet<(int X, int Y)> _invalidatedTargets = new HashSet<(int, int)>();
+    // A queue to remember the last 4 positions to avoid getting stuck in loops
+    private readonly Queue<(int X, int Y)> _recentPositions = new Queue<(int, int)>();
 
     public void SetBotId(Guid botId)
     {
         _botId = botId;
     }
 
+    public Guid GetBotId()
+    {
+        return _botId;
+    }
+
     public BotCommand ProcessState(GameState gameState)
     {
         var bot = gameState.Animals.FirstOrDefault(a => a.Id == _botId);
-        if (bot == null) return new BotCommand { Action = BotAction.Right }; // Should not happen
+        var command = new BotCommand { Action = BotAction.Right }; // Default fallback
 
-        // =================================================================
-        // HIERARCHY OF DECISIONS
-        // =================================================================
+        if (bot == null)
+            return command;
 
-        // 1. SURVIVAL: Flee from immediate danger
-        var fleeCommand = FleeIfNecessary(bot, gameState);
-        if (fleeCommand != null) return fleeCommand;
-
-        // 2. STRATEGIC ITEM USAGE: Use a held power-up if it's a good time
-        var useItemCommand = UseItemIfStrategic(bot, gameState);
-        if (useItemCommand != null) return useItemCommand;
-
-        // 3. TARGET MANAGEMENT: Decide what we should be chasing
-        UpdateTarget(bot, gameState);
-
-        // If after all logic, we have no target, explore safely
-        if (_currentTarget == null)
+        // --- ANTI-LOOP LOGIC: Record current position ---
+        // Add current position to our history
+        _recentPositions.Enqueue((bot.X, bot.Y));
+        // Keep the history limited to the last 4 ticks
+        if (_recentPositions.Count > 4)
         {
-            Console.WriteLine("No valid targets. Exploring...");
-            return FindSafestMove(bot, gameState, null);
+            _recentPositions.Dequeue();
         }
 
-        // 4. MOVEMENT: Move towards the chosen target
-        return MoveTowardsTarget(bot, gameState);
-    }
-
-    private void UpdateTarget(Animal bot, GameState gameState)
-    {
-        // Clear invalidated targets if they reappear (e.g., pellet respawn)
-        _invalidatedTargets.RemoveWhere(t => gameState.Cells.Any(c => c.X == t.X && c.Y == t.Y && GetCellValue(c.Content) > 0));
-
-        // Condition 1: Check if we've reached our current target
-        if (_currentTarget != null && bot.X == _currentTarget.X && bot.Y == _currentTarget.Y)
+        // --- #3 PROACTIVE EVASION (SURVIVAL FIRST) ---
+        bool isCloakActive = bot.ActivePowerUp?.Type == PowerUpType.ChameleonCloak;
+        if (!isCloakActive)
         {
-            _currentTarget = null;
-            _ticksStuckOnTarget = 0;
-        }
-
-        // Condition 2: Check if we're stuck on the current target
-        if (_currentTarget != null && _ticksStuckOnTarget > STUCK_THRESHOLD)
-        {
-            Console.WriteLine($"STUCK on target at ({_currentTarget.X},{_currentTarget.Y}). Invalidating and finding new target.");
-            _invalidatedTargets.Add((_currentTarget.X, _currentTarget.Y));
-            _currentTarget = null;
-            _ticksStuckOnTarget = 0;
-        }
-
-        // Condition 3: If we don't have a target, find the best one
-        if (_currentTarget == null)
-        {
-            _currentTarget = FindBestTarget(bot, gameState);
-        }
-    }
-
-    private Cell? FindBestTarget(Animal bot, GameState gameState)
-    {
-        var allValidTargets = gameState.Cells
-            .Where(c => GetCellValue(c.Content) > 0 && !_invalidatedTargets.Contains((c.X, c.Y)))
-            .ToList();
-
-        if (!allValidTargets.Any()) return null;
-
-        // STRATEGY: If score streak is active, prioritize maintaining it above all else!
-        if (bot.ScoreStreak > 0)
-        {
-            var closestPellet = allValidTargets
-                .Where(t => t.Content == CellContent.Pellet)
-                .OrderBy(t => Math.Abs(t.X - bot.X) + Math.Abs(t.Y - bot.Y))
+            var closestZookeeper = gameState.Zookeepers
+                .OrderBy(zk => Math.Abs(zk.X - bot.X) + Math.Abs(zk.Y - bot.Y))
                 .FirstOrDefault();
 
-            if (closestPellet != null)
+            int fleeThreshold = 4;
+            if (closestZookeeper != null && Math.Abs(closestZookeeper.X - bot.X) + Math.Abs(closestZookeeper.Y - bot.Y) <= fleeThreshold)
             {
-                Console.WriteLine($"Score streak active! Prioritizing nearest pellet at ({closestPellet.X},{closestPellet.Y})");
-                return closestPellet;
+                Console.WriteLine($"FLEE MODE: Zookeeper at ({closestZookeeper.X},{closestZookeeper.Y}) is too close!");
+                return Flee(bot, closestZookeeper, gameState);
             }
         }
 
-        // DEFAULT STRATEGY: Hunt for the most valuable power-up or pellet
-        return allValidTargets
-            .OrderByDescending(t => CalculateDesirability(t, bot))
-            .FirstOrDefault();
+        // --- STRATEGIC POWER-UP USAGE ---
+        if (bot.HeldPowerUp != null)
+        {
+            bool shouldUseItem = ShouldUsePowerUp(bot, gameState);
+            if (shouldUseItem)
+            {
+                Console.WriteLine($"Planned Action: UseItem (strategically activating {bot.HeldPowerUp})");
+                return new BotCommand { Action = BotAction.UseItem };
+            }
+        }
+
+        // --- SMARTER TARGETING ---
+        var allTargets = gameState.Cells.Where(c => GetCellValue(c.Content) > 0);
+        if (!allTargets.Any())
+        {
+            // No targets left, move randomly but safely
+            return FindSafestMove(bot, gameState, null);
+        }
+
+        var target = allTargets.OrderByDescending(t => CalculateDesirability(t, bot)).First();
+
+        // --- EXECUTE MOVEMENT ---
+        return FindSafestMove(bot, gameState, target);
     }
 
-    private BotCommand MoveTowardsTarget(Animal bot, GameState gameState)
+    private BotCommand Flee(Animal bot, Zookeeper zookeeper, GameState gameState)
     {
-        var command = FindSafestMove(bot, gameState, _currentTarget);
+        var directions = GetDirections();
+        var bestFleeMove = directions
+            .Select(dir => new
+            {
+                Action = dir.action,
+                NewX = bot.X + dir.dx,
+                NewY = bot.Y + dir.dy,
+                Cell = gameState.Cells.FirstOrDefault(c => c.X == bot.X + dir.dx && c.Y == bot.Y + dir.dy)
+            })
+            .Where(move => move.Cell != null && move.Cell.Content != CellContent.Wall) // Must be a valid, non-wall tile
+            .OrderByDescending(move => Math.Abs(move.NewX - zookeeper.X) + Math.Abs(move.NewY - zookeeper.Y)) // Pick move that is furthest from zk
+            .FirstOrDefault();
 
-        // Check if we made progress towards the target with the chosen move
-        var moveDelta = GetMoveDelta(command.Action);
-        int newX = bot.X + moveDelta.dx;
-        int newY = bot.Y + moveDelta.dy;
-
-        int oldDist = Math.Abs(bot.X - _currentTarget.X) + Math.Abs(bot.Y - _currentTarget.Y);
-        int newDist = Math.Abs(newX - _currentTarget.X) + Math.Abs(newY - _currentTarget.Y);
-
-        if (newDist >= oldDist)
+        if (bestFleeMove != null)
         {
-            _ticksStuckOnTarget++;
-        }
-        else
-        {
-            _ticksStuckOnTarget = 0; // We made progress, reset the counter
+            return new BotCommand { Action = bestFleeMove.Action };
         }
 
-        return command;
+        // If trapped, try any safe move
+        return FindSafestMove(bot, gameState, null);
     }
 
     private BotCommand FindSafestMove(Animal bot, GameState gameState, Cell? target)
@@ -138,20 +108,30 @@ public class BotService
         var directions = GetDirections();
         int currentDistance = target != null ? Math.Abs(bot.X - target.X) + Math.Abs(bot.Y - target.Y) : int.MaxValue;
 
-        var bestMove = directions
-            .Select(dir =>
+        var potentialMoves = directions.Select(dir =>
+        {
+            int newX = bot.X + dir.dx;
+            int newY = bot.Y + dir.dy;
+            var cell = gameState.Cells.FirstOrDefault(c => c.X == newX && c.Y == newY);
+            bool isSafe = cell != null && cell.Content != CellContent.Wall;
+            bool isRepeat = _recentPositions.Contains((newX, newY));
+            int newDistance = target != null ? Math.Abs(newX - target.X) + Math.Abs(newY - target.Y) : int.MaxValue;
+
+            return new
             {
-                int newX = bot.X + dir.dx;
-                int newY = bot.Y + dir.dy;
-                var cell = gameState.Cells.FirstOrDefault(c => c.X == newX && c.Y == newY);
-                bool isSafe = cell != null && cell.Content != CellContent.Wall;
-                int newDistance = target != null ? Math.Abs(newX - target.X) + Math.Abs(newY - target.Y) : int.MaxValue;
-                return new { Action = dir.action, IsSafe = isSafe, Distance = newDistance };
-            })
-            .Where(m => m.IsSafe)
-            .OrderBy(m => m.Distance) // Primary sort: get closer to target
-            .ThenBy(m => Guid.NewGuid()) // Secondary sort: random to break ties and prevent simple loops
-            .FirstOrDefault();
+                Action = dir.action,
+                IsSafe = isSafe,
+                IsRepeat = isRepeat,
+                Distance = newDistance
+            };
+        }).ToList();
+
+        // Prioritize moves: 1. Closer, not a repeat. 2. Closer, is a repeat. 3. Not closer, not a repeat. 4. Any safe move.
+        var bestMove =
+            potentialMoves.Where(m => m.IsSafe && !m.IsRepeat && m.Distance < currentDistance).OrderBy(m => m.Distance).FirstOrDefault() ??
+            potentialMoves.Where(m => m.IsSafe && m.Distance < currentDistance).OrderBy(m => m.Distance).FirstOrDefault() ??
+            potentialMoves.Where(m => m.IsSafe && !m.IsRepeat).FirstOrDefault() ??
+            potentialMoves.Where(m => m.IsSafe).FirstOrDefault();
 
         if (bestMove != null)
         {
@@ -160,70 +140,38 @@ public class BotService
             return new BotCommand { Action = bestMove.Action };
         }
 
-        return new BotCommand { Action = BotAction.Right }; // Absolute fallback
+        // Absolute last resort, should not happen on a valid map
+        return new BotCommand { Action = BotAction.Right };
     }
 
-    private BotCommand? FleeIfNecessary(Animal bot, GameState gameState)
+    private bool ShouldUsePowerUp(Animal bot, GameState gameState)
     {
-        bool isCloakActive = bot.ActivePowerUp?.Type == PowerUpType.ChameleonCloak;
-        if (isCloakActive) return null;
+        if (bot.HeldPowerUp == null) return false;
 
-        var closestZookeeper = gameState.Zookeepers
-            .OrderBy(zk => Math.Abs(zk.X - bot.X) + Math.Abs(zk.Y - bot.Y))
-            .FirstOrDefault();
-
-        int fleeThreshold = 4;
-        if (closestZookeeper != null && Math.Abs(closestZookeeper.X - bot.X) + Math.Abs(closestZookeeper.Y - bot.Y) <= fleeThreshold)
-        {
-            Console.WriteLine($"FLEE MODE: Zookeeper at ({closestZookeeper.X},{closestZookeeper.Y}) is too close!");
-            var bestFleeMove = GetDirections()
-                .Select(dir => new { Action = dir.action, NewX = bot.X + dir.dx, NewY = bot.Y + dir.dy })
-                .Where(move => {
-                    var cell = gameState.Cells.FirstOrDefault(c => c.X == move.NewX && c.Y == move.NewY);
-                    return cell != null && cell.Content != CellContent.Wall;
-                })
-                .OrderByDescending(move => Math.Abs(move.NewX - closestZookeeper.X) + Math.Abs(move.NewY - closestZookeeper.Y))
-                .FirstOrDefault();
-
-            if (bestFleeMove != null) return new BotCommand { Action = bestFleeMove.Action };
-        }
-        return null;
-    }
-
-    private BotCommand? UseItemIfStrategic(Animal bot, GameState gameState)
-    {
-        if (bot.HeldPowerUp == null) return null;
-        bool shouldUse = false;
         switch (bot.HeldPowerUp)
         {
             case PowerUpType.ChameleonCloak:
-                shouldUse = gameState.Zookeepers.Any(zk => Math.Abs(zk.X - bot.X) + Math.Abs(zk.Y - bot.Y) < 5);
-                break;
+                var isZookeeperNear = gameState.Zookeepers.Any(zk => Math.Abs(zk.X - bot.X) + Math.Abs(zk.Y - bot.Y) < 5);
+                return isZookeeperNear;
             case PowerUpType.BigMooseJuice:
             case PowerUpType.Scavenger:
-                shouldUse = gameState.Cells.Count(c => c.Content == CellContent.Pellet && Math.Abs(c.X - bot.X) + Math.Abs(c.Y - bot.Y) < 6) > 5;
-                break;
+                var pelletsNearby = gameState.Cells.Count(c => c.Content == CellContent.Pellet && Math.Abs(c.X - bot.X) + Math.Abs(c.Y - bot.Y) < 6);
+                return pelletsNearby > 5;
             case PowerUpType.PowerPellet:
-                shouldUse = true;
-                break;
+                return true;
+            default:
+                return false;
         }
-        if (shouldUse)
-        {
-            Console.WriteLine($"Planned Action: UseItem (strategically activating {bot.HeldPowerUp})");
-            return new BotCommand { Action = BotAction.UseItem };
-        }
-        return null;
     }
 
     private double GetCellValue(CellContent content)
     {
-        // Drastically increased power-up values to ensure they are prioritized
         switch (content)
         {
-            case CellContent.PowerPellet: return 1000.0;
+            case CellContent.PowerPellet: return 100.0;
             case CellContent.Scavenger:
-            case CellContent.BigMooseJuice: return 800.0;
-            case CellContent.ChameleonCloak: return 600.0;
+            case CellContent.BigMooseJuice: return 50.0;
+            case CellContent.ChameleonCloak: return 40.0;
             case CellContent.Pellet: return 10.0;
             default: return 0.0;
         }
@@ -237,20 +185,14 @@ public class BotService
         return value / distance;
     }
 
-    private List<(BotAction action, int dx, int dy)> GetDirections() => new List<(BotAction, int, int)>
+    private List<(BotAction action, int dx, int dy)> GetDirections()
     {
-        (BotAction.Up, 0, -1), (BotAction.Down, 0, 1), (BotAction.Left, -1, 0), (BotAction.Right, 1, 0)
-    };
-
-    private (int dx, int dy) GetMoveDelta(BotAction action)
-    {
-        switch (action)
+        return new List<(BotAction, int, int)>
         {
-            case BotAction.Up: return (0, -1);
-            case BotAction.Down: return (0, 1);
-            case BotAction.Left: return (-1, 0);
-            case BotAction.Right: return (1, 0);
-            default: return (0, 0);
-        }
+            (BotAction.Up, 0, -1),
+            (BotAction.Down, 0, 1),
+            (BotAction.Left, -1, 0),
+            (BotAction.Right, 1, 0)
+        };
     }
 }
