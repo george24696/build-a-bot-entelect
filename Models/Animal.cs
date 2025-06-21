@@ -7,6 +7,8 @@ public class Animal
     public Guid Id { get; set; }
     public int X { get; set; }
     public int Y { get; set; }
+
+    public int ScoreStreak { get; set; }
     public int SpawnX { get; set; }
     public int SpawnY { get; set; }
     public int Score { get; set; }
